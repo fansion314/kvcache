@@ -1,24 +1,84 @@
+//! ```compile_fail
+//! use kvcache::LruCache;
+//! use std::time::Duration;
+//!
+//! let mut cache = LruCache::<i32, i32>::new(2);
+//! cache.put_with_ttl(1, 1, Duration::from_secs(1));
+//! ```
+//!
+//! ```compile_fail
+//! use kvcache::ClockCache;
+//! use std::time::Duration;
+//!
+//! let mut cache = ClockCache::<i32, i32>::new(2);
+//! cache.get_and_refresh_expiry(&1);
+//! let _ = Duration::from_secs(1);
+//! ```
+
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::hash::Hash;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
-use std::cell::Cell;
-#[cfg(test)]
-use std::rc::Rc;
-
-pub struct LruCache<K, V> {
-    inner: CacheCore<K, V, SystemClock>,
+pub struct LruCache<K, V>
+where
+    K: Eq + Hash + Clone,
+{
+    inner: CacheCore<K, V, LruPolicy, PlainEntry<K, V>, SystemClock>,
 }
 
 impl<K, V> LruCache<K, V>
 where
     K: Eq + Hash + Clone,
 {
-    pub fn new(capacity: usize, default_ttl: Duration) -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self {
-            inner: CacheCore::new(capacity, default_ttl, SystemClock),
+            inner: CacheCore::new(capacity, (), SystemClock),
+        }
+    }
+
+    pub fn get(&mut self, key: &K) -> Option<&V> {
+        self.inner.get(key)
+    }
+
+    pub fn put(&mut self, key: K, value: V) -> Option<V> {
+        self.inner.put(key, value)
+    }
+
+    pub fn invalidate(&mut self, key: &K) -> Option<V> {
+        self.inner.invalidate(key)
+    }
+}
+
+pub struct TtlLruCache<K, V, C = SystemClock>
+where
+    K: Eq + Hash + Clone,
+    C: Clock,
+{
+    inner: CacheCore<K, V, LruPolicy, TtlEntry<K, V>, C>,
+}
+
+impl<K, V> TtlLruCache<K, V, SystemClock>
+where
+    K: Eq + Hash + Clone,
+{
+    pub fn new(capacity: usize, default_ttl: Duration) -> Self {
+        Self::with_clock(capacity, default_ttl, SystemClock)
+    }
+}
+
+impl<K, V, C> TtlLruCache<K, V, C>
+where
+    K: Eq + Hash + Clone,
+    C: Clock,
+{
+    #[allow(dead_code)]
+    pub(crate) fn with_clock(capacity: usize, default_ttl: Duration, clock: C) -> Self {
+        Self {
+            inner: CacheCore::new(capacity, default_ttl, clock),
         }
     }
 
@@ -35,7 +95,7 @@ where
     }
 
     pub fn put_with_ttl(&mut self, key: K, value: V, ttl: Duration) -> Option<V> {
-        self.inner.put_with_ttl(key, value, ttl)
+        self.inner.put_with_arg(key, value, ttl)
     }
 
     pub fn invalidate(&mut self, key: &K) -> Option<V> {
@@ -43,12 +103,92 @@ where
     }
 }
 
-trait Clock {
+pub struct ClockCache<K, V>
+where
+    K: Eq + Hash + Clone,
+{
+    inner: CacheCore<K, V, ClockPolicy, PlainEntry<K, V>, SystemClock>,
+}
+
+impl<K, V> ClockCache<K, V>
+where
+    K: Eq + Hash + Clone,
+{
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: CacheCore::new(capacity, (), SystemClock),
+        }
+    }
+
+    pub fn get(&mut self, key: &K) -> Option<&V> {
+        self.inner.get(key)
+    }
+
+    pub fn put(&mut self, key: K, value: V) -> Option<V> {
+        self.inner.put(key, value)
+    }
+
+    pub fn invalidate(&mut self, key: &K) -> Option<V> {
+        self.inner.invalidate(key)
+    }
+}
+
+pub struct TtlClockCache<K, V, C = SystemClock>
+where
+    K: Eq + Hash + Clone,
+    C: Clock,
+{
+    inner: CacheCore<K, V, ClockPolicy, TtlEntry<K, V>, C>,
+}
+
+impl<K, V> TtlClockCache<K, V, SystemClock>
+where
+    K: Eq + Hash + Clone,
+{
+    pub fn new(capacity: usize, default_ttl: Duration) -> Self {
+        Self::with_clock(capacity, default_ttl, SystemClock)
+    }
+}
+
+impl<K, V, C> TtlClockCache<K, V, C>
+where
+    K: Eq + Hash + Clone,
+    C: Clock,
+{
+    #[allow(dead_code)]
+    pub(crate) fn with_clock(capacity: usize, default_ttl: Duration, clock: C) -> Self {
+        Self {
+            inner: CacheCore::new(capacity, default_ttl, clock),
+        }
+    }
+
+    pub fn get(&mut self, key: &K) -> Option<&V> {
+        self.inner.get(key)
+    }
+
+    pub fn get_and_refresh_expiry(&mut self, key: &K) -> Option<&V> {
+        self.inner.get_and_refresh_expiry(key)
+    }
+
+    pub fn put(&mut self, key: K, value: V) -> Option<V> {
+        self.inner.put(key, value)
+    }
+
+    pub fn put_with_ttl(&mut self, key: K, value: V, ttl: Duration) -> Option<V> {
+        self.inner.put_with_arg(key, value, ttl)
+    }
+
+    pub fn invalidate(&mut self, key: &K) -> Option<V> {
+        self.inner.invalidate(key)
+    }
+}
+
+pub trait Clock {
     fn now(&self) -> Instant;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct SystemClock;
+pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now(&self) -> Instant {
@@ -56,34 +196,184 @@ impl Clock for SystemClock {
     }
 }
 
-struct CacheCore<K, V, C> {
-    capacity: usize,
-    default_ttl: Duration,
-    slots: Vec<Slot<K, V>>,
-    index: HashMap<K, usize>,
-    head: Option<usize>,
-    tail: Option<usize>,
-    free: Vec<usize>,
-    expiries: BinaryHeap<Reverse<ExpiryRecord>>,
-    clock: C,
+#[derive(Clone)]
+pub(crate) struct StepClock {
+    now: Rc<Cell<Instant>>,
 }
 
-impl<K, V, C> CacheCore<K, V, C>
+impl StepClock {
+    #[allow(dead_code)]
+    pub(crate) fn new() -> Self {
+        Self {
+            now: Rc::new(Cell::new(Instant::now())),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn advance(&self, delta: Duration) {
+        let next = self.now.get().checked_add(delta).expect("clock overflowed");
+        self.now.set(next);
+    }
+}
+
+impl Clock for StepClock {
+    fn now(&self) -> Instant {
+        self.now.get()
+    }
+}
+
+trait EntryFlavor<K, V> {
+    type InsertArg: Copy;
+
+    fn uses_expiry() -> bool;
+    fn new(key: K, value: V, insert: Self::InsertArg, now: Instant) -> Self;
+    fn key(&self) -> &K;
+    fn value(&self) -> &V;
+    fn replace_value(&mut self, value: V, insert: Self::InsertArg, now: Instant) -> V;
+    fn is_expired(&self, now: Instant) -> bool;
+    fn refresh_expiry(&mut self, now: Instant);
+    fn expires_at(&self) -> Option<Instant>;
+}
+
+struct PlainEntry<K, V> {
+    key: K,
+    value: V,
+}
+
+impl<K, V> EntryFlavor<K, V> for PlainEntry<K, V> {
+    type InsertArg = ();
+
+    fn uses_expiry() -> bool {
+        false
+    }
+
+    fn new(key: K, value: V, _insert: Self::InsertArg, _now: Instant) -> Self {
+        Self { key, value }
+    }
+
+    fn key(&self) -> &K {
+        &self.key
+    }
+
+    fn value(&self) -> &V {
+        &self.value
+    }
+
+    fn replace_value(&mut self, value: V, _insert: Self::InsertArg, _now: Instant) -> V {
+        std::mem::replace(&mut self.value, value)
+    }
+
+    fn is_expired(&self, _now: Instant) -> bool {
+        false
+    }
+
+    fn refresh_expiry(&mut self, _now: Instant) {}
+
+    fn expires_at(&self) -> Option<Instant> {
+        None
+    }
+}
+
+struct TtlEntry<K, V> {
+    key: K,
+    value: V,
+    ttl: Duration,
+    expires_at: Instant,
+}
+
+impl<K, V> EntryFlavor<K, V> for TtlEntry<K, V> {
+    type InsertArg = Duration;
+
+    fn uses_expiry() -> bool {
+        true
+    }
+
+    fn new(key: K, value: V, ttl: Self::InsertArg, now: Instant) -> Self {
+        Self {
+            key,
+            value,
+            ttl,
+            expires_at: checked_deadline(now, ttl),
+        }
+    }
+
+    fn key(&self) -> &K {
+        &self.key
+    }
+
+    fn value(&self) -> &V {
+        &self.value
+    }
+
+    fn replace_value(&mut self, value: V, ttl: Self::InsertArg, now: Instant) -> V {
+        let old_value = std::mem::replace(&mut self.value, value);
+        self.ttl = ttl;
+        self.expires_at = checked_deadline(now, ttl);
+        old_value
+    }
+
+    fn is_expired(&self, now: Instant) -> bool {
+        self.expires_at <= now
+    }
+
+    fn refresh_expiry(&mut self, now: Instant) {
+        self.expires_at = checked_deadline(now, self.ttl);
+    }
+
+    fn expires_at(&self) -> Option<Instant> {
+        Some(self.expires_at)
+    }
+}
+
+trait Policy<E> {
+    type Meta: Default;
+    type State;
+
+    fn new_state(capacity: usize) -> Self::State;
+    fn on_insert(slots: &mut [Slot<E, Self::Meta>], state: &mut Self::State, idx: usize);
+    fn on_access(slots: &mut [Slot<E, Self::Meta>], state: &mut Self::State, idx: usize);
+    fn on_remove(slots: &mut [Slot<E, Self::Meta>], state: &mut Self::State, idx: usize);
+    fn select_victim(slots: &mut [Slot<E, Self::Meta>], state: &mut Self::State) -> usize;
+}
+
+struct CacheCore<K, V, P, E, C>
 where
     K: Eq + Hash + Clone,
+    P: Policy<E>,
+    E: EntryFlavor<K, V> + IntoValue<V>,
     C: Clock,
 {
-    fn new(capacity: usize, default_ttl: Duration, clock: C) -> Self {
+    capacity: usize,
+    default_insert: E::InsertArg,
+    slots: Vec<Slot<E, P::Meta>>,
+    index: HashMap<K, usize>,
+    free: Vec<usize>,
+    expiries: BinaryHeap<Reverse<ExpiryRecord>>,
+    policy_state: P::State,
+    clock: C,
+    _policy: PhantomData<P>,
+    _value: PhantomData<V>,
+}
+
+impl<K, V, P, E, C> CacheCore<K, V, P, E, C>
+where
+    K: Eq + Hash + Clone,
+    P: Policy<E>,
+    E: EntryFlavor<K, V> + IntoValue<V>,
+    C: Clock,
+{
+    fn new(capacity: usize, default_insert: E::InsertArg, clock: C) -> Self {
         Self {
             capacity,
-            default_ttl,
+            default_insert,
             slots: Vec::with_capacity(capacity),
             index: HashMap::with_capacity(capacity),
-            head: None,
-            tail: None,
             free: Vec::with_capacity(capacity),
             expiries: BinaryHeap::with_capacity(capacity),
+            policy_state: P::new_state(capacity),
             clock,
+            _policy: PhantomData,
+            _value: PhantomData,
         }
     }
 
@@ -96,44 +386,36 @@ where
     }
 
     fn put(&mut self, key: K, value: V) -> Option<V> {
-        self.put_with_ttl(key, value, self.default_ttl)
+        self.put_with_arg(key, value, self.default_insert)
     }
 
-    fn put_with_ttl(&mut self, key: K, value: V, ttl: Duration) -> Option<V> {
+    fn put_with_arg(&mut self, key: K, value: V, insert: E::InsertArg) -> Option<V> {
         if self.capacity == 0 {
             return None;
         }
 
-        self.reap_expired();
-
-        if let Some(&idx) = self.index.get(&key) {
-            return Some(self.update_existing(idx, value, ttl));
+        if E::uses_expiry() {
+            self.reap_expired();
         }
 
-        let idx = if let Some(idx) = self.free.pop() {
-            idx
-        } else if self.slots.len() < self.capacity {
-            let idx = self.slots.len();
-            self.slots.push(Slot::vacant());
-            idx
-        } else {
-            let tail = self.tail.expect("tail must exist when cache is full");
-            let _ = self.remove_slot(tail).expect("tail slot must be occupied");
-            self.free
-                .pop()
-                .expect("removing the tail should produce a free slot")
-        };
+        if let Some(&idx) = self.index.get(&key) {
+            return Some(self.update_existing(idx, value, insert));
+        }
 
-        self.insert_at_slot(idx, key, value, ttl);
+        let idx = self.acquire_slot();
+        self.insert_at_slot(idx, key, value, insert);
         None
     }
 
     fn invalidate(&mut self, key: &K) -> Option<V> {
         let idx = *self.index.get(key)?;
 
-        if self.is_expired(idx, self.clock.now()) {
-            let _ = self.remove_slot(idx);
-            return None;
+        if E::uses_expiry() {
+            let now = self.clock.now();
+            if self.is_expired(idx, now) {
+                let _ = self.remove_slot(idx);
+                return None;
+            }
         }
 
         self.remove_slot(idx)
@@ -141,70 +423,101 @@ where
 
     fn get_internal(&mut self, key: &K, refresh_expiry: bool) -> Option<&V> {
         let idx = *self.index.get(key)?;
-        let now = self.clock.now();
 
-        if self.is_expired(idx, now) {
-            let _ = self.remove_slot(idx);
-            return None;
+        if E::uses_expiry() {
+            let now = self.clock.now();
+            if self.is_expired(idx, now) {
+                let _ = self.remove_slot(idx);
+                return None;
+            }
+
+            if refresh_expiry {
+                self.refresh_expiry(idx, now);
+            }
         }
 
-        if refresh_expiry {
-            self.refresh_expiry(idx, now);
-        }
-
-        self.move_to_head(idx);
+        P::on_access(&mut self.slots, &mut self.policy_state, idx);
         self.value_ref(idx)
     }
 
-    fn update_existing(&mut self, idx: usize, value: V, ttl: Duration) -> V {
+    fn acquire_slot(&mut self) -> usize {
+        if let Some(idx) = self.free.pop() {
+            return idx;
+        }
+
+        if self.slots.len() < self.capacity {
+            let idx = self.slots.len();
+            self.slots.push(Slot::vacant());
+            return idx;
+        }
+
+        let victim = P::select_victim(&mut self.slots, &mut self.policy_state);
+        let _ = self
+            .remove_slot(victim)
+            .expect("victim selection must choose a live slot");
+        self.free
+            .pop()
+            .expect("removing a victim should release a reusable slot")
+    }
+
+    fn update_existing(&mut self, idx: usize, value: V, insert: E::InsertArg) -> V {
         let now = self.clock.now();
-        let next_generation = self.bump_generation(idx);
-        let expires_at = checked_deadline(now, ttl);
+        let generation = self.bump_generation(idx);
+        let old_value;
+        let expires_at;
 
-        let entry = self.entry_mut(idx).expect("indexed slot must be occupied");
-        let old_value = std::mem::replace(&mut entry.value, value);
-        entry.ttl = ttl;
-        entry.expires_at = expires_at;
+        {
+            let entry = self.entry_mut(idx).expect("indexed slot must be occupied");
+            old_value = entry.replace_value(value, insert, now);
+            expires_at = entry.expires_at();
+        }
 
-        self.expiries.push(Reverse(ExpiryRecord {
-            expires_at,
-            index: idx,
-            generation: next_generation,
-        }));
-        self.move_to_head(idx);
+        if let Some(expires_at) = expires_at {
+            self.expiries.push(Reverse(ExpiryRecord {
+                expires_at,
+                index: idx,
+                generation,
+            }));
+        }
 
+        P::on_access(&mut self.slots, &mut self.policy_state, idx);
         old_value
     }
 
-    fn insert_at_slot(&mut self, idx: usize, key: K, value: V, ttl: Duration) {
-        let expires_at = checked_deadline(self.clock.now(), ttl);
+    fn insert_at_slot(&mut self, idx: usize, key: K, value: V, insert: E::InsertArg) {
+        let now = self.clock.now();
+        let entry = E::new(key.clone(), value, insert, now);
+        let expires_at = entry.expires_at();
         let generation = self.slots[idx].generation;
 
-        self.slots[idx].entry = Some(Entry {
-            key: key.clone(),
-            value,
-            ttl,
-            expires_at,
-        });
-        self.slots[idx].prev = None;
-        self.slots[idx].next = None;
-
+        self.slots[idx].entry = Some(entry);
         self.index.insert(key, idx);
-        self.attach_to_head(idx);
-        self.expiries.push(Reverse(ExpiryRecord {
-            expires_at,
-            index: idx,
-            generation,
-        }));
+        P::on_insert(&mut self.slots, &mut self.policy_state, idx);
+
+        if let Some(expires_at) = expires_at {
+            self.expiries.push(Reverse(ExpiryRecord {
+                expires_at,
+                index: idx,
+                generation,
+            }));
+        }
     }
 
     fn refresh_expiry(&mut self, idx: usize, now: Instant) {
-        let ttl = self.entry(idx).expect("occupied slot must have entry").ttl;
-        let expires_at = checked_deadline(now, ttl);
-        let generation = self.bump_generation(idx);
+        if !E::uses_expiry() {
+            return;
+        }
 
-        let entry = self.entry_mut(idx).expect("occupied slot must have entry");
-        entry.expires_at = expires_at;
+        if self.entry(idx).and_then(EntryFlavor::expires_at).is_none() {
+            return;
+        }
+
+        let generation = self.bump_generation(idx);
+        let expires_at = {
+            let entry = self.entry_mut(idx).expect("indexed slot must be occupied");
+            entry.refresh_expiry(now);
+            entry.expires_at().expect("refreshed expiry must exist")
+        };
 
         self.expiries.push(Reverse(ExpiryRecord {
             expires_at,
@@ -214,6 +527,10 @@ where
     }
 
     fn reap_expired(&mut self) {
+        if !E::uses_expiry() {
+            return;
+        }
+
         let now = self.clock.now();
 
         while let Some(record) = self.expiries.peek().copied() {
@@ -239,22 +556,19 @@ where
             return None;
         }
 
-        self.detach(idx);
+        P::on_remove(&mut self.slots, &mut self.policy_state, idx);
 
         let slot = &mut self.slots[idx];
         let entry = slot.entry.take().expect("slot was checked as occupied");
-        slot.prev = None;
-        slot.next = None;
-
-        self.index.remove(&entry.key);
+        self.index.remove(entry.key());
         self.free.push(idx);
 
-        Some(entry.value)
+        Some(entry.into_value())
     }
 
     fn is_expired(&self, idx: usize, now: Instant) -> bool {
         self.entry(idx)
-            .map(|entry| entry.expires_at <= now)
+            .map(|entry| entry.is_expired(now))
             .unwrap_or(false)
     }
 
@@ -271,61 +585,15 @@ where
         next
     }
 
-    fn move_to_head(&mut self, idx: usize) {
-        if self.head == Some(idx) {
-            return;
-        }
-
-        self.detach(idx);
-        self.attach_to_head(idx);
-    }
-
-    fn detach(&mut self, idx: usize) {
-        if self.slots[idx].entry.is_none() {
-            return;
-        }
-
-        let prev = self.slots[idx].prev;
-        let next = self.slots[idx].next;
-
-        if let Some(prev_idx) = prev {
-            self.slots[prev_idx].next = next;
-        } else {
-            self.head = next;
-        }
-
-        if let Some(next_idx) = next {
-            self.slots[next_idx].prev = prev;
-        } else {
-            self.tail = prev;
-        }
-
-        self.slots[idx].prev = None;
-        self.slots[idx].next = None;
-    }
-
-    fn attach_to_head(&mut self, idx: usize) {
-        self.slots[idx].prev = None;
-        self.slots[idx].next = self.head;
-
-        if let Some(old_head) = self.head {
-            self.slots[old_head].prev = Some(idx);
-        } else {
-            self.tail = Some(idx);
-        }
-
-        self.head = Some(idx);
-    }
-
     fn value_ref(&self, idx: usize) -> Option<&V> {
-        self.entry(idx).map(|entry| &entry.value)
+        self.entry(idx).map(EntryFlavor::value)
     }
 
-    fn entry(&self, idx: usize) -> Option<&Entry<K, V>> {
+    fn entry(&self, idx: usize) -> Option<&E> {
         self.slots.get(idx)?.entry.as_ref()
     }
 
-    fn entry_mut(&mut self, idx: usize) -> Option<&mut Entry<K, V>> {
+    fn entry_mut(&mut self, idx: usize) -> Option<&mut E> {
         self.slots.get_mut(idx)?.entry.as_mut()
     }
 
@@ -333,45 +601,172 @@ where
     fn len(&self) -> usize {
         self.index.len()
     }
+}
 
-    #[cfg(test)]
-    fn lru_keys(&self) -> Vec<K> {
-        let mut keys = Vec::with_capacity(self.index.len());
-        let mut cursor = self.head;
-        while let Some(idx) = cursor {
-            let entry = self
-                .entry(idx)
-                .expect("lru chain must only contain live entries");
-            keys.push(entry.key.clone());
-            cursor = self.slots[idx].next;
-        }
-        keys
+trait IntoValue<V> {
+    fn into_value(self) -> V;
+}
+
+impl<K, V> IntoValue<V> for PlainEntry<K, V> {
+    fn into_value(self) -> V {
+        self.value
     }
 }
 
-struct Slot<K, V> {
-    entry: Option<Entry<K, V>>,
-    prev: Option<usize>,
-    next: Option<usize>,
+impl<K, V> IntoValue<V> for TtlEntry<K, V> {
+    fn into_value(self) -> V {
+        self.value
+    }
+}
+
+struct Slot<E, M> {
+    entry: Option<E>,
+    meta: M,
     generation: u64,
 }
 
-impl<K, V> Slot<K, V> {
+impl<E, M> Slot<E, M>
+where
+    M: Default,
+{
     fn vacant() -> Self {
         Self {
             entry: None,
-            prev: None,
-            next: None,
+            meta: M::default(),
             generation: 0,
         }
     }
 }
 
-struct Entry<K, V> {
-    key: K,
-    value: V,
-    ttl: Duration,
-    expires_at: Instant,
+#[derive(Clone, Copy, Debug, Default)]
+struct LruMeta {
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LruState {
+    head: Option<usize>,
+    tail: Option<usize>,
+}
+
+struct LruPolicy;
+
+impl<E> Policy<E> for LruPolicy {
+    type Meta = LruMeta;
+    type State = LruState;
+
+    fn new_state(_capacity: usize) -> Self::State {
+        LruState::default()
+    }
+
+    fn on_insert(slots: &mut [Slot<E, Self::Meta>], state: &mut Self::State, idx: usize) {
+        lru_attach_to_head(slots, state, idx);
+    }
+
+    fn on_access(slots: &mut [Slot<E, Self::Meta>], state: &mut Self::State, idx: usize) {
+        if state.head == Some(idx) {
+            return;
+        }
+
+        lru_detach(slots, state, idx);
+        lru_attach_to_head(slots, state, idx);
+    }
+
+    fn on_remove(slots: &mut [Slot<E, Self::Meta>], state: &mut Self::State, idx: usize) {
+        lru_detach(slots, state, idx);
+    }
+
+    fn select_victim(slots: &mut [Slot<E, Self::Meta>], state: &mut Self::State) -> usize {
+        let _ = slots;
+        state.tail.expect("tail must exist when the cache is full")
+    }
+}
+
+fn lru_detach<E>(slots: &mut [Slot<E, LruMeta>], state: &mut LruState, idx: usize) {
+    let prev = slots[idx].meta.prev;
+    let next = slots[idx].meta.next;
+
+    if let Some(prev_idx) = prev {
+        slots[prev_idx].meta.next = next;
+    } else {
+        state.head = next;
+    }
+
+    if let Some(next_idx) = next {
+        slots[next_idx].meta.prev = prev;
+    } else {
+        state.tail = prev;
+    }
+
+    slots[idx].meta.prev = None;
+    slots[idx].meta.next = None;
+}
+
+fn lru_attach_to_head<E>(slots: &mut [Slot<E, LruMeta>], state: &mut LruState, idx: usize) {
+    slots[idx].meta.prev = None;
+    slots[idx].meta.next = state.head;
+
+    if let Some(old_head) = state.head {
+        slots[old_head].meta.prev = Some(idx);
+    } else {
+        state.tail = Some(idx);
+    }
+
+    state.head = Some(idx);
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ClockMeta {
+    referenced: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ClockState {
+    hand: usize,
+}
+
+struct ClockPolicy;
+
+impl<E> Policy<E> for ClockPolicy {
+    type Meta = ClockMeta;
+    type State = ClockState;
+
+    fn new_state(_capacity: usize) -> Self::State {
+        ClockState::default()
+    }
+
+    fn on_insert(slots: &mut [Slot<E, Self::Meta>], _state: &mut Self::State, idx: usize) {
+        slots[idx].meta.referenced = true;
+    }
+
+    fn on_access(slots: &mut [Slot<E, Self::Meta>], _state: &mut Self::State, idx: usize) {
+        slots[idx].meta.referenced = true;
+    }
+
+    fn on_remove(slots: &mut [Slot<E, Self::Meta>], _state: &mut Self::State, idx: usize) {
+        slots[idx].meta.referenced = false;
+    }
+
+    fn select_victim(slots: &mut [Slot<E, Self::Meta>], state: &mut Self::State) -> usize {
+        assert!(!slots.is_empty(), "clock eviction requires at least one slot");
+
+        loop {
+            let idx = state.hand % slots.len();
+            state.hand = (state.hand + 1) % slots.len();
+
+            if slots[idx].entry.is_none() {
+                continue;
+            }
+
+            if slots[idx].meta.referenced {
+                slots[idx].meta.referenced = false;
+                continue;
+            }
+
+            return idx;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -387,71 +782,55 @@ fn checked_deadline(now: Instant, ttl: Duration) -> Instant {
 }
 
 #[cfg(test)]
-#[derive(Clone)]
-struct TestClock {
-    now: Rc<Cell<Instant>>,
-}
-
-#[cfg(test)]
-impl TestClock {
-    fn new() -> Self {
-        Self {
-            now: Rc::new(Cell::new(Instant::now())),
-        }
-    }
-
-    fn advance(&self, delta: Duration) {
-        let next = self
-            .now
-            .get()
-            .checked_add(delta)
-            .expect("test clock overflowed");
-        self.now.set(next);
-    }
-}
-
-#[cfg(test)]
-impl Clock for TestClock {
-    fn now(&self) -> Instant {
-        self.now.get()
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cache_with_clock<K, V>(
+    fn ttl_lru_with_clock<K, V>(
         capacity: usize,
         default_ttl: Duration,
-    ) -> (CacheCore<K, V, TestClock>, TestClock)
+    ) -> (TtlLruCache<K, V, StepClock>, StepClock)
     where
         K: Eq + Hash + Clone,
     {
-        let clock = TestClock::new();
-        (CacheCore::new(capacity, default_ttl, clock.clone()), clock)
+        let clock = StepClock::new();
+        (
+            TtlLruCache::with_clock(capacity, default_ttl, clock.clone()),
+            clock,
+        )
+    }
+
+    fn ttl_clock_with_clock<K, V>(
+        capacity: usize,
+        default_ttl: Duration,
+    ) -> (TtlClockCache<K, V, StepClock>, StepClock)
+    where
+        K: Eq + Hash + Clone,
+    {
+        let clock = StepClock::new();
+        (
+            TtlClockCache::with_clock(capacity, default_ttl, clock.clone()),
+            clock,
+        )
     }
 
     #[test]
-    fn basic_put_get_and_lru_ordering() {
-        let (mut cache, _) = cache_with_clock::<i32, i32>(2, Duration::from_secs(30));
+    fn lru_without_ttl_supports_basic_get_put_invalidate() {
+        let mut cache = LruCache::new(2);
 
         assert_eq!(cache.put(1, 10), None);
         assert_eq!(cache.put(2, 20), None);
         assert_eq!(cache.get(&1), Some(&10));
-        assert_eq!(cache.lru_keys(), vec![1, 2]);
-        assert_eq!(cache.get(&2), Some(&20));
-        assert_eq!(cache.lru_keys(), vec![2, 1]);
+        assert_eq!(cache.invalidate(&1), Some(10));
+        assert_eq!(cache.get(&1), None);
     }
 
     #[test]
-    fn evicts_lru_when_no_entries_are_expired() {
-        let (mut cache, _) = cache_with_clock::<i32, i32>(2, Duration::from_secs(30));
+    fn lru_without_ttl_evicts_tail() {
+        let mut cache = LruCache::new(2);
 
         cache.put(1, 10);
         cache.put(2, 20);
         assert_eq!(cache.get(&1), Some(&10));
-
         cache.put(3, 30);
 
         assert_eq!(cache.get(&1), Some(&10));
@@ -460,19 +839,19 @@ mod tests {
     }
 
     #[test]
-    fn expired_entry_returns_none_on_get() {
-        let (mut cache, clock) = cache_with_clock::<i32, i32>(2, Duration::from_secs(5));
+    fn ttl_lru_expires_entries_on_read() {
+        let (mut cache, clock) = ttl_lru_with_clock::<i32, i32>(2, Duration::from_secs(5));
 
         cache.put(1, 10);
         clock.advance(Duration::from_secs(5));
 
         assert_eq!(cache.get(&1), None);
-        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.inner.len(), 0);
     }
 
     #[test]
-    fn put_reuses_expired_slot_before_evicting_live_lru() {
-        let (mut cache, clock) = cache_with_clock::<i32, i32>(2, Duration::from_secs(10));
+    fn ttl_lru_reuses_expired_slot_before_live_lru() {
+        let (mut cache, clock) = ttl_lru_with_clock::<i32, i32>(2, Duration::from_secs(10));
 
         cache.put_with_ttl(1, 10, Duration::from_secs(2));
         cache.put_with_ttl(2, 20, Duration::from_secs(20));
@@ -483,74 +862,25 @@ mod tests {
         assert_eq!(cache.get(&1), None);
         assert_eq!(cache.get(&2), Some(&20));
         assert_eq!(cache.get(&3), Some(&30));
-        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.inner.len(), 2);
     }
 
     #[test]
-    fn invalidate_returns_removed_value_for_live_entry_only() {
-        let (mut cache, clock) = cache_with_clock::<i32, i32>(2, Duration::from_secs(10));
-
-        cache.put(1, 10);
-        assert_eq!(cache.invalidate(&1), Some(10));
-        assert_eq!(cache.invalidate(&1), None);
-
-        cache.put_with_ttl(2, 20, Duration::from_secs(1));
-        clock.advance(Duration::from_secs(1));
-
-        assert_eq!(cache.invalidate(&2), None);
-        assert_eq!(cache.len(), 0);
-    }
-
-    #[test]
-    fn invalidated_entry_is_removed_from_lru_and_expiry_tracking() {
-        let (mut cache, clock) = cache_with_clock::<i32, i32>(2, Duration::from_secs(10));
-
-        cache.put_with_ttl(1, 10, Duration::from_secs(2));
-        cache.put(2, 20);
-        assert_eq!(cache.invalidate(&1), Some(10));
-        clock.advance(Duration::from_secs(3));
-
-        cache.put(3, 30);
-
-        assert_eq!(cache.get(&2), Some(&20));
-        assert_eq!(cache.get(&3), Some(&30));
-        assert_eq!(cache.lru_keys(), vec![3, 2]);
-    }
-
-    #[test]
-    fn updating_existing_key_refreshes_value_ttl_and_recency() {
-        let (mut cache, clock) = cache_with_clock::<i32, i32>(2, Duration::from_secs(5));
-
-        cache.put(1, 10);
-        clock.advance(Duration::from_secs(2));
-        assert_eq!(cache.put_with_ttl(1, 15, Duration::from_secs(4)), Some(10));
-
-        clock.advance(Duration::from_secs(3));
-        assert_eq!(cache.get(&1), Some(&15));
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache.lru_keys(), vec![1]);
-    }
-
-    #[test]
-    fn get_and_refresh_expiry_differs_from_plain_get() {
-        let (mut cache, clock) = cache_with_clock::<i32, &'static str>(2, Duration::from_secs(3));
+    fn ttl_lru_refreshes_expiry_without_changing_value() {
+        let (mut cache, clock) =
+            ttl_lru_with_clock::<i32, &'static str>(2, Duration::from_secs(3));
 
         cache.put(1, "one");
         clock.advance(Duration::from_secs(2));
-        assert_eq!(cache.get(&1), Some(&"one"));
-        clock.advance(Duration::from_secs(1));
-        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get_and_refresh_expiry(&1), Some(&"one"));
+        clock.advance(Duration::from_secs(2));
 
-        cache.put(2, "two");
-        clock.advance(Duration::from_secs(2));
-        assert_eq!(cache.get_and_refresh_expiry(&2), Some(&"two"));
-        clock.advance(Duration::from_secs(2));
-        assert_eq!(cache.get(&2), Some(&"two"));
+        assert_eq!(cache.get(&1), Some(&"one"));
     }
 
     #[test]
-    fn stale_expiry_records_do_not_remove_live_entries() {
-        let (mut cache, clock) = cache_with_clock::<i32, i32>(2, Duration::from_secs(5));
+    fn ttl_lru_stale_expiry_records_do_not_remove_live_entries() {
+        let (mut cache, clock) = ttl_lru_with_clock::<i32, i32>(2, Duration::from_secs(5));
 
         cache.put(1, 10);
         clock.advance(Duration::from_secs(1));
@@ -567,44 +897,101 @@ mod tests {
     }
 
     #[test]
-    fn slots_are_reused_after_invalidation_and_expiration() {
-        let (mut cache, clock) = cache_with_clock::<i32, i32>(2, Duration::from_secs(2));
+    fn clock_without_ttl_uses_second_chance_eviction() {
+        let mut cache = ClockCache::new(3);
 
         cache.put(1, 10);
         cache.put(2, 20);
-        assert_eq!(cache.invalidate(&1), Some(10));
-        cache.put_with_ttl(3, 30, Duration::from_secs(10));
-
-        let first_layout = cache.slots.len();
-        clock.advance(Duration::from_secs(2));
+        cache.put(3, 30);
         cache.put(4, 40);
 
-        assert_eq!(cache.slots.len(), first_layout);
-        assert_eq!(cache.get(&2), None);
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&2), Some(&20));
         assert_eq!(cache.get(&3), Some(&30));
         assert_eq!(cache.get(&4), Some(&40));
     }
 
     #[test]
-    fn zero_capacity_cache_is_always_empty() {
-        let (mut cache, _) = cache_with_clock::<i32, i32>(0, Duration::from_secs(1));
+    fn clock_reads_protect_entries_with_second_chance() {
+        let mut cache = ClockCache::new(3);
 
-        assert_eq!(cache.put(1, 10), None);
-        assert_eq!(cache.get(&1), None);
-        assert_eq!(cache.invalidate(&1), None);
-        assert_eq!(cache.len(), 0);
+        cache.put(1, 10);
+        cache.put(2, 20);
+        cache.put(3, 30);
+        cache.put(4, 40);
+        assert_eq!(cache.get(&2), Some(&20));
+        cache.put(5, 50);
+
+        assert_eq!(cache.get(&2), Some(&20));
+        assert_eq!(cache.get(&3), None);
+        assert_eq!(cache.get(&4), Some(&40));
+        assert_eq!(cache.get(&5), Some(&50));
     }
 
     #[test]
-    fn public_wrapper_matches_core_behavior() {
-        let mut cache = LruCache::new(2, Duration::from_secs(60));
+    fn ttl_clock_reuses_expired_slot_before_scanning_for_victim() {
+        let (mut cache, clock) = ttl_clock_with_clock::<i32, i32>(2, Duration::from_secs(10));
 
-        assert_eq!(cache.put("a", 1), None);
-        assert_eq!(cache.put("b", 2), None);
-        assert_eq!(cache.get(&"a"), Some(&1));
-        assert_eq!(cache.put("c", 3), None);
-        assert_eq!(cache.get(&"b"), None);
-        assert_eq!(cache.invalidate(&"a"), Some(1));
-        assert_eq!(cache.get(&"c"), Some(&3));
+        cache.put_with_ttl(1, 10, Duration::from_secs(2));
+        cache.put_with_ttl(2, 20, Duration::from_secs(20));
+        clock.advance(Duration::from_secs(3));
+        cache.put(3, 30);
+
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&2), Some(&20));
+        assert_eq!(cache.get(&3), Some(&30));
+    }
+
+    #[test]
+    fn ttl_clock_expires_entries_on_read() {
+        let (mut cache, clock) = ttl_clock_with_clock::<i32, i32>(2, Duration::from_secs(4));
+
+        cache.put(1, 10);
+        clock.advance(Duration::from_secs(4));
+
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.inner.len(), 0);
+    }
+
+    #[test]
+    fn ttl_clock_supports_refreshing_expiry() {
+        let (mut cache, clock) =
+            ttl_clock_with_clock::<i32, &'static str>(2, Duration::from_secs(3));
+
+        cache.put(1, "one");
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(cache.get_and_refresh_expiry(&1), Some(&"one"));
+        clock.advance(Duration::from_secs(2));
+
+        assert_eq!(cache.get(&1), Some(&"one"));
+    }
+
+    #[test]
+    fn ttl_clock_invalidate_returns_none_for_expired_entries() {
+        let (mut cache, clock) = ttl_clock_with_clock::<i32, i32>(2, Duration::from_secs(1));
+
+        cache.put(1, 10);
+        clock.advance(Duration::from_secs(1));
+
+        assert_eq!(cache.invalidate(&1), None);
+        assert_eq!(cache.inner.len(), 0);
+    }
+
+    #[test]
+    fn all_variants_handle_zero_capacity() {
+        let mut lru = LruCache::<i32, i32>::new(0);
+        let mut clock = ClockCache::<i32, i32>::new(0);
+        let (mut ttl_lru, _) = ttl_lru_with_clock::<i32, i32>(0, Duration::from_secs(1));
+        let (mut ttl_clock, _) = ttl_clock_with_clock::<i32, i32>(0, Duration::from_secs(1));
+
+        assert_eq!(lru.put(1, 1), None);
+        assert_eq!(clock.put(1, 1), None);
+        assert_eq!(ttl_lru.put(1, 1), None);
+        assert_eq!(ttl_clock.put(1, 1), None);
+
+        assert_eq!(lru.get(&1), None);
+        assert_eq!(clock.get(&1), None);
+        assert_eq!(ttl_lru.get(&1), None);
+        assert_eq!(ttl_clock.get(&1), None);
     }
 }

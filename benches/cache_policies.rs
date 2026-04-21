@@ -294,5 +294,10 @@ fn bench_expiration_stress(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_replacement, bench_ttl_overhead, bench_expiration_stress);
+criterion_group!(
+    benches,
+    bench_replacement,
+    bench_ttl_overhead,
+    bench_expiration_stress
+);
 criterion_main!(benches);

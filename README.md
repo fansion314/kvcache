@@ -76,6 +76,78 @@ assert_eq!(cache.get_and_refresh_expiry(&"b"), Some(&2));
 cargo test
 ```
 
+## Mini-Redis
+
+This workspace also includes a small Redis-like TCP cache service built on top of
+`TtlLruCache<String, String>` with Tokio networking:
+
+- package: `miniredis`
+- location: `apps/miniredis`
+- server: `cargo run -p miniredis --bin miniredis-server -- --addr 127.0.0.1:6379`
+- client: `cargo run -p miniredis --bin miniredis-client -- --addr 127.0.0.1:6379`
+- storage: `TtlLruCache<String, String>`
+- persistence: none; restarting the server clears all keys
+
+Default server configuration:
+
+- `--addr 127.0.0.1:6379`
+- `--capacity 1024`
+- `--default-ttl-secs 60`
+
+Supported commands:
+
+- `PING`
+- `GET key`
+- `SET key value`
+- `SETEX key seconds value`
+- `GETEX key`
+- `DEL key`
+- `QUIT`
+
+Client REPL example:
+
+```text
+miniredis> SET greeting "hello world"
+OK
+miniredis> GET greeting
+hello world
+miniredis> SETEX token 5 abc123
+OK
+miniredis> GETEX token
+abc123
+miniredis> DEL greeting
+1
+miniredis> QUIT
+OK
+```
+
+## Shortlink Service
+
+This workspace also includes a memory-only shortlink service built with `axum`:
+
+- package: `shortlink-service`
+- location: `apps/shortlink-service`
+- run: `cargo run -p shortlink-service`
+- storage: `TtlLruCache<String, Arc<LinkRecord>>`
+- persistence: none; restarting the process clears all short links
+
+Default runtime configuration:
+
+- `HOST=0.0.0.0`
+- `PORT=3000`
+- `CACHE_CAPACITY=10000`
+- `DEFAULT_TTL_SECS=86400`
+- `PUBLIC_BASE_URL=http://127.0.0.1:3000`
+
+Main HTTP endpoints:
+
+- `GET /`
+- `GET /healthz`
+- `POST /api/links`
+- `GET /api/links/:alias`
+- `DELETE /api/links/:alias`
+- `GET /:alias`
+
 ## Running Benchmarks
 
 Formal Criterion benchmark:

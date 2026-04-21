@@ -3,6 +3,10 @@ name = "kvcache"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["apps/miniredis", "apps/shortlink-service"]
+resolver = "3"
+
 [dependencies]
 
 [dev-dependencies]

@@ -749,7 +749,10 @@ impl<E> Policy<E> for ClockPolicy {
     }
 
     fn select_victim(slots: &mut [Slot<E, Self::Meta>], state: &mut Self::State) -> usize {
-        assert!(!slots.is_empty(), "clock eviction requires at least one slot");
+        assert!(
+            !slots.is_empty(),
+            "clock eviction requires at least one slot"
+        );
 
         loop {
             let idx = state.hand % slots.len();
@@ -867,8 +870,7 @@ mod tests {
 
     #[test]
     fn ttl_lru_refreshes_expiry_without_changing_value() {
-        let (mut cache, clock) =
-            ttl_lru_with_clock::<i32, &'static str>(2, Duration::from_secs(3));
+        let (mut cache, clock) = ttl_lru_with_clock::<i32, &'static str>(2, Duration::from_secs(3));
 
         cache.put(1, "one");
         clock.advance(Duration::from_secs(2));

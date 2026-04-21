@@ -233,10 +233,9 @@ where
     }
 
     fn remove_slot(&mut self, idx: usize) -> Option<V> {
-        let generation = self.bump_generation(idx);
+        let _ = self.bump_generation(idx);
         let slot = self.slots.get(idx)?;
         if slot.entry.is_none() {
-            self.slots[idx].generation = generation;
             return None;
         }
 
@@ -246,7 +245,6 @@ where
         let entry = slot.entry.take().expect("slot was checked as occupied");
         slot.prev = None;
         slot.next = None;
-        slot.generation = generation;
 
         self.index.remove(&entry.key);
         self.free.push(idx);
@@ -341,7 +339,9 @@ where
         let mut keys = Vec::with_capacity(self.index.len());
         let mut cursor = self.head;
         while let Some(idx) = cursor {
-            let entry = self.entry(idx).expect("lru chain must only contain live entries");
+            let entry = self
+                .entry(idx)
+                .expect("lru chain must only contain live entries");
             keys.push(entry.key.clone());
             cursor = self.slots[idx].next;
         }

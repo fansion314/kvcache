@@ -162,6 +162,12 @@ Quick local comparison runner:
 cargo run --example cache_bench
 ```
 
+Modeled end-to-end run with a custom miss penalty:
+
+```bash
+cargo run --example cache_bench -- --db-read-ms 5 --db-write-ms 5
+```
+
 Benchmark workload matrix:
 
 - 3 benchmark families:
@@ -182,6 +188,21 @@ TTL benchmarks use a deterministic synthetic clock instead of `sleep`. This is i
 - Which replacement policy is faster when there is no expiration logic?
 - How much overhead does TTL add when entries are not expected to expire?
 - How do `TTL + LRU` and `TTL + Clock` behave when expiration pressure is intentionally high?
+
+For the example benchmark, the cache is modeled with more realistic semantics:
+
+- `GET` miss performs a database read and then populates the cache
+- `PUT` is write-through: write database first, then update the cache
+- a no-cache baseline is reported for the same trace
+- reads and writes are still randomized overall, but writes are biased earlier inside each local window to warm the cache before later reads
+
+Startup parameters:
+
+- `--db-read-ms <number>`
+- `--db-write-ms <number>`
+- `--db-miss-ms <number>`: backward-compatible alias for `--db-read-ms`
+
+The default is `5ms` for both read and write database access. That is a reasonable middle-ground for a generic remote lookup simulation. `50ms` is usually too high for a neutral default and is better treated as a deliberately pessimistic or tail-latency scenario.
 
 ## Benchmark Results
 
@@ -247,3 +268,40 @@ Overall guidance:
 - If you want the fastest plain cache on high-hit workloads, `ClockCache` looks attractive.
 - If you want predictable plain-cache behavior under heavier churn, `LruCache` remains competitive.
 - TTL support does have measurable bookkeeping cost in most scenarios, so it is worth benchmarking against your real workload before choosing a default.
+
+## Modeled End-to-End Results
+
+The Criterion tables above measure cache-core cost. The example benchmark is intended to answer a different question: if a miss or write has to go to a database, how much does the cache help end-to-end?
+
+The table below was collected on this machine on 2026-04-22 with:
+
+- command: `cargo run --example cache_bench -- --db-read-ms 5 --db-write-ms 5`
+- modeled database read cost: `5ms`
+- modeled database write cost: `5ms`
+- capacity: `4096`
+- operations per scenario: `100_000`
+
+### Replacement Policy With Read-Through / Write-Through Modeling
+
+| Scenario | No Cache | LRU Hit Rate | LRU Modeled Throughput | Clock Hit Rate | Clock Modeled Throughput |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| High hit, 95% reads / 5% writes | 200 ops/s | 97.88% | 2848 ops/s | 97.88% | 2848 ops/s |
+| High hit, 50% reads / 50% writes | 200 ops/s | 97.60% | 391 ops/s | 97.60% | 391 ops/s |
+| Low hit, 95% reads / 5% writes | 200 ops/s | 91.54% | 1533 ops/s | 91.54% | 1533 ops/s |
+| Low hit, 50% reads / 50% writes | 200 ops/s | 79.00% | 331 ops/s | 78.96% | 330 ops/s |
+
+What these modeled results mean:
+
+- The no-cache baseline is flat at roughly `200 ops/s` because every operation pays a `5ms` database cost.
+- With read-through caching and writes biased earlier in each local window, the `95/5` scenarios now have higher hit rates than the `50/50` scenarios, which is much closer to real application behavior.
+- In these traces, `LRU` and `Clock` end up with nearly identical hit rates, so their modeled end-to-end throughput is also nearly identical.
+- The biggest modeled performance win comes from avoiding database reads, not from shaving a few microseconds off cache-core bookkeeping.
+
+### TTL Notes Under Modeled Read-Through / Write-Through Cost
+
+The same example benchmark also reports TTL variants:
+
+- `long TTL` runs keep the same hit rate as the matching plain policy, so the modeled end-to-end throughput stays almost the same once database cost dominates.
+- `short TTL` stress runs reduce the hit rate, but they still outperform the no-cache baseline because misses no longer happen on every read.
+
+If you are choosing a cache policy for a production system, the modeled example benchmark is usually the more decision-relevant one. If you are optimizing the cache implementation itself, the Criterion raw microbenchmark is still the better tool.
